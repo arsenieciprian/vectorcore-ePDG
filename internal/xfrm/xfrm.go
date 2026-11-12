@@ -231,6 +231,26 @@ func algoState(p ChildSAParams, encKey, intKey []byte) (auth, crypt, aead *netli
 		}, nil
 }
 
+// reqidFor gives every UE its own reqid, derived from its inner (PAA) address.
+// voxbee lab: without it the policy templates (outer src/dst, proto ESP, reqid 0)
+// match the SAs of every UE that shares the same outer address — several UEs
+// behind one NAT, or several test UEs on one host — and the kernel sends the
+// downlink of all of them through one SA.
+func reqidFor(p ChildSAParams) int {
+	if p.RemoteTS == nil {
+		return 0
+	}
+	ip4 := p.RemoteTS.IP.To4()
+	if ip4 == nil {
+		return 0
+	}
+	id := (int(ip4[0])<<24 | int(ip4[1])<<16 | int(ip4[2])<<8 | int(ip4[3])) & 0x7fffffff
+	if id == 0 {
+		return 1
+	}
+	return id
+}
+
 func buildSAs(p ChildSAParams, localIP, remoteIP net.IP) (*netlink.XfrmState, *netlink.XfrmState) {
 	authIn, cryptIn, aeadIn := algoState(p, p.EncKeyIn, p.IntKeyIn)
 	authOut, cryptOut, aeadOut := algoState(p, p.EncKeyOut, p.IntKeyOut)
@@ -242,6 +262,7 @@ func buildSAs(p ChildSAParams, localIP, remoteIP net.IP) (*netlink.XfrmState, *n
 		Proto:        netlink.XFRM_PROTO_ESP,
 		Mode:         netlink.XFRM_MODE_TUNNEL,
 		Spi:          int(p.InboundSPI),
+		Reqid:        reqidFor(p),
 		ReplayWindow: 32,
 		Ifid:         int(p.IfID),
 		Auth:         authIn,
@@ -263,6 +284,7 @@ func buildSAs(p ChildSAParams, localIP, remoteIP net.IP) (*netlink.XfrmState, *n
 		Proto:        netlink.XFRM_PROTO_ESP,
 		Mode:         netlink.XFRM_MODE_TUNNEL,
 		Spi:          int(p.OutboundSPI),
+		Reqid:        reqidFor(p),
 		ReplayWindow: 32,
 		Ifid:         int(p.IfID),
 		Auth:         authOut,
@@ -285,12 +307,14 @@ func buildPolicies(p ChildSAParams, localIP, remoteIP net.IP) (*netlink.XfrmPoli
 		Dst:   localIP,
 		Proto: netlink.XFRM_PROTO_ESP,
 		Mode:  netlink.XFRM_MODE_TUNNEL,
+		Reqid: reqidFor(p),
 	}
 	tmplOut := netlink.XfrmPolicyTmpl{
 		Src:   localIP,
 		Dst:   remoteIP,
 		Proto: netlink.XFRM_PROTO_ESP,
 		Mode:  netlink.XFRM_MODE_TUNNEL,
+		Reqid: reqidFor(p),
 	}
 	// Inbound policy: UE→ePDG traffic must arrive via ESP tunnel.
 	inPol := &netlink.XfrmPolicy{
