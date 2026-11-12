@@ -68,7 +68,19 @@ type ikeSA struct {
 
 	// MOBIKE (RFC 4555) state (under mu).
 	mobikeEnabled bool   // negotiated in IKE_AUTH; permits UPDATE_SA_ADDRESSES handling
-	cookie2       []byte // pending return-routability challenge; nil when no migration in progress
+	cookie2       []byte // unused (kept for the rekey copy); see rr* below
+
+	// Return routability check in flight (RFC 4555 §3.7): our own INFORMATIONAL
+	// request carrying COOKIE2, sent to the address the UE announced. The IPsec
+	// SAs move to rrAddr only once the UE echoes the cookie.
+	rrPending   bool
+	rrAddr      *net.UDPAddr // address under test
+	rrCookie    []byte
+	rrMsgID     uint32
+	rrPacket    []byte // encrypted request, resent as-is on retransmission
+	rrTries     int
+	rrMultiAddr bool      // the same request went to more than one address
+	rrStarted   time.Time
 
 	// VoLTE→VoWiFi handover (3GPP TS 24.302 §8.2.3).
 	// Non-nil when UE sent a non-zero INTERNAL_IP4_ADDRESS in CFG_REQUEST,

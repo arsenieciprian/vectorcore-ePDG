@@ -42,7 +42,9 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 	// Handle UE's response to our DPD probe (no decrypt needed — it's empty).
 	if isUEResponse {
 		sa.mu.Lock()
-		if !sa.dpdSentAt.IsZero() && hdr.MessageID == sa.dpdMsgID {
+		if sa.rrPending && hdr.MessageID == sa.rrMsgID && sa.state == ikeStateEstablished {
+			s.handleRRResponse(sa, pkt, remote)
+		} else if !sa.dpdSentAt.IsZero() && hdr.MessageID == sa.dpdMsgID {
 			sa.lastSeen = time.Now()
 			sa.dpdSentAt = time.Time{}
 			sa.dpdMsgID = 0
@@ -81,7 +83,8 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 
 	// MOBIKE UPDATE_SA_ADDRESSES: path migration — sends its own response.
 	if hasUpdateSA && sa.mobikeEnabled {
-		s.handleUpdateSA(conn, remote, sa, hdr.MessageID, incomingCookie2, natt)
+		noNats, hasNoNats := notifyData(innerType, plain, message.NO_NATS_ALLOWED)
+		s.handleUpdateSA(conn, remote, sa, hdr.MessageID, incomingCookie2, noNats, hasNoNats, natt)
 		return
 	}
 
@@ -371,58 +374,259 @@ func parseInfoPayloads(firstType uint8, plain []byte, deleteIKE *bool, deleteESP
 	return
 }
 
+// Return routability check timing (RFC 4555 §3.7).
+const (
+	rrRetransmit = 2 * time.Second
+	rrMaxTries   = 3
+)
+
+// notifyData walks a decrypted payload chain and returns the notification data
+// of the first Notify payload of the given type.
+func notifyData(firstType uint8, plain []byte, want uint16) ([]byte, bool) {
+	curType := firstType
+	off := 0
+	for curType != 0 && off+4 <= len(plain) {
+		nextType := plain[off]
+		payloadLen := int(binary.BigEndian.Uint16(plain[off+2 : off+4]))
+		if payloadLen < 4 || off+payloadLen > len(plain) {
+			return nil, false
+		}
+		body := plain[off+4 : off+payloadLen]
+		if message.IkePayloadType(curType) == message.TypeN && len(body) >= 4 {
+			dataOff := 4 + int(body[1])
+			if binary.BigEndian.Uint16(body[2:4]) == want && dataOff <= len(body) {
+				return append([]byte(nil), body[dataOff:]...), true
+			}
+		}
+		off += payloadLen
+		curType = nextType
+	}
+	return nil, false
+}
+
+// noNatsMatch compares the addresses and ports carried in NO_NATS_ALLOWED
+// (RFC 4555 §4.2.6: source IP, destination IP, source port, destination port)
+// with the ones this packet was actually received with.
+func noNatsMatch(data []byte, remote *net.UDPAddr, localIP net.IP, localPort int) bool {
+	var ipLen int
+	switch len(data) {
+	case 12:
+		ipLen = 4
+	case 36:
+		ipLen = 16
+	default:
+		return false
+	}
+	src := net.IP(data[:ipLen])
+	dst := net.IP(data[ipLen : 2*ipLen])
+	srcPort := int(binary.BigEndian.Uint16(data[2*ipLen:]))
+	dstPort := int(binary.BigEndian.Uint16(data[2*ipLen+2:]))
+	return src.Equal(remote.IP) && srcPort == remote.Port && dst.Equal(localIP) && dstPort == localPort
+}
+
+func sameUDPAddr(a, b *net.UDPAddr) bool {
+	return a != nil && b != nil && a.IP.Equal(b.IP) && a.Port == b.Port
+}
+
 // handleUpdateSA processes a MOBIKE UPDATE_SA_ADDRESSES request (RFC 4555 §3.5).
+// The request is answered right away; the IPsec SAs follow once the return
+// routability check of the announced address has completed (§3.7).
 // Must be called with sa.mu held.
-func (s *Server) handleUpdateSA(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA, msgID uint32, incomingCookie2 []byte, natt bool) {
+func (s *Server) handleUpdateSA(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA, msgID uint32, incomingCookie2, noNats []byte, hasNoNats bool, natt bool) {
 	if sa.espProp == nil || sa.localIP == nil {
 		_ = s.sendEncryptedRaw(conn, remote, sa, message.INFORMATIONAL, msgID, 0, nil, natt)
 		return
 	}
+	localPort := 0
+	if lu, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		localPort = lu.Port
+	}
 
-	if len(incomingCookie2) == 0 || sa.cookie2 == nil {
-		// Step 1: UE announces new address. Challenge return routability with COOKIE2.
-		c2 := make([]byte, 16)
-		if _, err := rand.Read(c2); err != nil {
-			s.log.Error("MOBIKE: cookie2 gen failed", "err", err)
-			_ = s.sendEncryptedRaw(conn, remote, sa, message.INFORMATIONAL, msgID, 0, nil, natt)
-			return
+	var inner message.IKEPayloadContainer
+	reject := func(notify uint16, why string) {
+		inner.BuildNotification(message.TypeNone, notify, nil, nil)
+		if len(incomingCookie2) > 0 {
+			inner.BuildNotification(message.TypeNone, message.COOKIE2, nil, incomingCookie2)
 		}
-		sa.cookie2 = c2
-
-		var inner message.IKEPayloadContainer
-		inner.BuildNotification(message.TypeNone, message.COOKIE2, nil, c2)
 		if err := s.sendEncryptedResponse(conn, remote, sa, message.INFORMATIONAL, msgID, inner, natt); err != nil {
-			s.log.Warn("MOBIKE: send COOKIE2 challenge failed", "err", err)
+			s.log.Warn("MOBIKE: send response failed", "err", err)
 		}
-		s.log.Info("MOBIKE: COOKIE2 challenge sent", "imsi", sa.imsi, "new_addr", remote)
+		s.log.Warn("MOBIKE: UPDATE_SA_ADDRESSES refused", "reason", why, "imsi", sa.imsi, "addr", remote)
+	}
+
+	// §3.9: the UE forbids NATs on the path; any address or port rewritten on
+	// the way means one is there.
+	if hasNoNats && !noNatsMatch(noNats, remote, sa.localIP, localPort) {
+		reject(message.UNEXPECTED_NAT_DETECTED, "NO_NATS_ALLOWED and the addresses were rewritten")
+		return
+	}
+	// Local policy: the kernel SAs cannot change address family in place.
+	if (sa.remoteAddr.IP.To4() == nil) != (remote.IP.To4() == nil) {
+		reject(message.UNACCEPTABLE_ADDRESSES, "address family change")
 		return
 	}
 
-	// Step 3: UE echoes COOKIE2. Verify return routability before migrating.
-	if !constEqual(incomingCookie2, sa.cookie2) {
-		s.log.Warn("MOBIKE: COOKIE2 mismatch, ignoring", "imsi", sa.imsi, "remote", remote)
-		_ = s.sendEncryptedRaw(conn, remote, sa, message.INFORMATIONAL, msgID, 0, nil, natt)
+	// Normal response: NAT detection for the new path, COOKIE2 copied as-is.
+	inner.BuildNotification(message.TypeNone, message.NAT_DETECTION_SOURCE_IP, nil,
+		natHash(sa.spiI, sa.spiR, sa.localIP, uint16(localPort)))
+	inner.BuildNotification(message.TypeNone, message.NAT_DETECTION_DESTINATION_IP, nil,
+		natHash(sa.spiI, sa.spiR, remote.IP, uint16(remote.Port)))
+	if len(incomingCookie2) > 0 {
+		inner.BuildNotification(message.TypeNone, message.COOKIE2, nil, incomingCookie2)
+	}
+	if err := s.sendEncryptedResponse(conn, remote, sa, message.INFORMATIONAL, msgID, inner, natt); err != nil {
+		s.log.Warn("MOBIKE: send response failed", "err", err)
+	}
+
+	if sa.rrPending {
+		// The address changed again while a check is in flight. The outstanding
+		// request is retransmitted to the latest address; its answer no longer
+		// tells which address works (§3.7), which handleRRResponse accounts for.
+		sa.rrAddr = remote
+		sa.rrMultiAddr = true
+		sa.rrTries = 0
+		s.send(conn, remote, sa.rrPacket, sa.natT)
+		s.log.Info("MOBIKE: address changed during return routability check", "imsi", sa.imsi, "new_addr", remote)
+		return
+	}
+	if sameUDPAddr(sa.remoteAddr, remote) {
+		s.log.Info("MOBIKE: UPDATE_SA_ADDRESSES for the current path", "imsi", sa.imsi, "addr", remote)
+		return
+	}
+	s.startRRCheck(conn, sa, remote)
+}
+
+// startRRCheck sends our own INFORMATIONAL request with a fresh COOKIE2 to addr.
+// Must be called with sa.mu held.
+func (s *Server) startRRCheck(conn *net.UDPConn, sa *ikeSA, addr *net.UDPAddr) {
+	cookie := make([]byte, 16)
+	if _, err := rand.Read(cookie); err != nil {
+		s.log.Error("MOBIKE: cookie2 gen failed", "err", err)
+		return
+	}
+	var inner message.IKEPayloadContainer
+	inner.BuildNotification(message.TypeNone, message.COOKIE2, nil, cookie)
+	plain, err := inner.Encode()
+	if err != nil {
+		s.log.Error("MOBIKE: encode COOKIE2 request failed", "err", err)
+		return
+	}
+	totalLen, err := encryptedSKMessageLen(sa.saKey, len(plain))
+	if err != nil {
+		s.log.Error("MOBIKE: COOKIE2 request length", "err", err)
+		return
+	}
+	msgID := sa.ourMsgID
+	hdrBytes := buildIKERequestHeaderBytes(sa.spiI, sa.spiR, message.INFORMATIONAL, msgID, totalLen)
+	pkt, err := encryptSK(sa.saKey, uint8(inner[0].Type()), plain, hdrBytes)
+	if err != nil {
+		s.log.Error("MOBIKE: encrypt COOKIE2 request failed", "err", err)
+		return
+	}
+	sa.ourMsgID++
+
+	sa.rrPending = true
+	sa.rrAddr = addr
+	sa.rrCookie = cookie
+	sa.rrMsgID = msgID
+	sa.rrPacket = pkt
+	sa.rrTries = 0
+	sa.rrMultiAddr = false
+	sa.rrStarted = time.Now()
+
+	s.send(conn, addr, pkt, sa.natT)
+	s.log.Info("MOBIKE: return routability check started", "imsi", sa.imsi, "new_addr", addr, "msg_id", msgID)
+	time.AfterFunc(rrRetransmit, func() { s.rrTimerFired(sa, msgID) })
+}
+
+func (sa *ikeSA) clearRR() {
+	sa.rrPending = false
+	sa.rrAddr = nil
+	sa.rrCookie = nil
+	sa.rrPacket = nil
+	sa.rrTries = 0
+	sa.rrMultiAddr = false
+}
+
+// rrTimerFired retransmits the COOKIE2 request or gives the move up.
+func (s *Server) rrTimerFired(sa *ikeSA, msgID uint32) {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	if !sa.rrPending || sa.rrMsgID != msgID || sa.state != ikeStateEstablished {
+		return
+	}
+	sa.rrTries++
+	if sa.rrTries >= rrMaxTries {
+		s.log.Warn("MOBIKE: return routability check failed, SAs stay on the old address",
+			"imsi", sa.imsi, "claimed_addr", sa.rrAddr, "current_addr", sa.remoteAddr)
+		sa.clearRR()
+		return
+	}
+	conn := s.conn500
+	if sa.natT {
+		conn = s.conn4500
+	}
+	if conn == nil {
+		return
+	}
+	s.send(conn, sa.rrAddr, sa.rrPacket, sa.natT)
+	time.AfterFunc(rrRetransmit, func() { s.rrTimerFired(sa, msgID) })
+}
+
+// handleRRResponse processes the UE's answer to our COOKIE2 request.
+// Must be called with sa.mu held.
+func (s *Server) handleRRResponse(sa *ikeSA, pkt []byte, from *net.UDPAddr) {
+	innerType, plain, err := decryptSK(sa.saKey, pkt)
+	if err != nil {
+		s.log.Warn("MOBIKE: return routability response decrypt failed", "err", err, "remote", from)
+		return
+	}
+	echo, found := notifyData(innerType, plain, message.COOKIE2)
+	if !found || !constEqual(echo, sa.rrCookie) {
+		// §3.7: "If the values do not match, the IKE_SA MUST be closed."
+		s.log.Warn("MOBIKE: COOKIE2 mismatch in return routability response, closing IKE SA",
+			"imsi", sa.imsi, "remote", from, "cookie_present", found)
+		sa.clearRR()
+		sa.state = ikeStateDeleting
+		s.fullTeardown(sa, "mobike_rr_mismatch")
+		return
+	}
+	sa.lastSeen = time.Now()
+	addr, multi, started := sa.rrAddr, sa.rrMultiAddr, sa.rrStarted
+	sa.clearRR()
+
+	if sameUDPAddr(sa.remoteAddr, addr) {
+		s.log.Info("MOBIKE: UE is back on the current path, nothing to move", "imsi", sa.imsi, "addr", addr)
+		return
+	}
+	conn := s.conn500
+	if sa.natT {
+		conn = s.conn4500
+	}
+	if multi {
+		// The request went to several addresses, so this answer does not show
+		// which one works: check the latest one with a new request (§3.7).
+		if conn != nil {
+			s.startRRCheck(conn, sa, addr)
+		}
 		return
 	}
 
 	oldAddr := sa.remoteAddr
-	if err := s.migrateMobikeXFRM(sa, remote); err != nil {
-		s.log.Error("MOBIKE: XFRM migration failed", "err", err, "imsi", sa.imsi, "new_addr", remote)
-		_ = s.sendEncryptedRaw(conn, remote, sa, message.INFORMATIONAL, msgID, 0, nil, natt)
+	if err := s.migrateMobikeXFRM(sa, addr); err != nil {
+		s.log.Error("MOBIKE: XFRM migration failed", "err", err, "imsi", sa.imsi, "new_addr", addr)
 		return
 	}
-
-	sa.remoteAddr = remote
-	sa.cookie2 = nil
+	sa.remoteAddr = addr
 	if s.sessions != nil && sa.sessionID != "" {
 		if sess := s.sessions.Get(sa.sessionID); sess != nil {
 			sess.Lock()
-			sess.OuterIP = remote.String()
+			sess.OuterIP = addr.String()
 			sess.Unlock()
 		}
 	}
-	_ = s.sendEncryptedRaw(conn, remote, sa, message.INFORMATIONAL, msgID, 0, nil, natt)
-	s.log.Info("MOBIKE: path migrated", "imsi", sa.imsi, "old_addr", oldAddr, "new_addr", remote)
+	s.log.Info("MOBIKE: path migrated", "imsi", sa.imsi, "old_addr", oldAddr, "new_addr", addr,
+		"rr_check_ms", time.Since(started).Milliseconds())
 }
 
 // migrateMobikeXFRM replaces the XFRM CHILD SA outer endpoints.
@@ -537,6 +741,11 @@ func (s *Server) reaperLoop() {
 			}
 			sa.mu.Lock()
 			if sa.state != ikeStateEstablished {
+				sa.mu.Unlock()
+				continue
+			}
+			if sa.rrPending {
+				// One request of ours at a time: the COOKIE2 request is outstanding.
 				sa.mu.Unlock()
 				continue
 			}
