@@ -58,12 +58,18 @@ type ChildSAParams struct {
 
 // InstallChildSA programs inbound and outbound XFRM SAs and policies in the kernel.
 func InstallChildSA(p ChildSAParams) error {
+	return installChildSA(p, nil, nil)
+}
+
+func installChildSA(p ChildSAParams, inReplay, outReplay *netlink.XfrmReplayState) error {
 	localIP, remoteIP, err := resolveXFRMIPs(p.LocalIP, p.RemoteIP)
 	if err != nil {
 		return err
 	}
 
 	inbound, outbound := buildSAs(p, localIP, remoteIP)
+	inbound.Replay = inReplay
+	outbound.Replay = outReplay
 
 	if err := netlink.XfrmStateAdd(inbound); err != nil {
 		return fmt.Errorf("xfrm: add inbound SA (spi=%08x): %w", p.InboundSPI, err)
@@ -407,8 +413,22 @@ func RemoveChildSAStates(p ChildSAParams) error {
 // changing SPIs or keys. Used by MOBIKE (RFC 4555) when the UE changes IP address.
 // The old SA is removed best-effort; install of the new SA is authoritative.
 func MigrateChildSA(old, new ChildSAParams) error {
+	// The SPIs and keys stay the same, so the sequence numbers must carry over:
+	// an outbound SA restarting at 1 is dropped by the peer's anti-replay window.
+	var inReplay, outReplay *netlink.XfrmReplayState
+	if localIP, remoteIP, err := resolveXFRMIPs(old.LocalIP, old.RemoteIP); err == nil {
+		inbound, outbound := buildSAs(old, localIP, remoteIP)
+		if st, err := netlink.XfrmStateGet(inbound); err == nil && st != nil {
+			inReplay = st.Replay
+		}
+		if st, err := netlink.XfrmStateGet(outbound); err == nil && st != nil && st.Replay != nil {
+			r := *st.Replay
+			r.OSeq += 64 // packets sent between the read and the reinstall
+			outReplay = &r
+		}
+	}
 	_ = RemoveChildSA(old) // best-effort; old SA may already be evicted by kernel
-	return InstallChildSA(new)
+	return installChildSA(new, inReplay, outReplay)
 }
 
 // LocalIPFor returns the local IP address that the OS would use to reach remote.
