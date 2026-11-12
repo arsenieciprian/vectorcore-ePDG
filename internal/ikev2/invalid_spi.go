@@ -3,6 +3,7 @@ package ikev2
 import (
 	"encoding/binary"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,9 +14,9 @@ import (
 // section 2.21.4: "A node needs to limit the rate at which it will send
 // messages in response to unprotected messages").
 const (
-	invalidSPIPerSource = time.Second // at most one answer per source address in this interval
+	invalidSPIPerSA     = time.Second // at most one answer per IKE SA (source address and SPI) in this interval
 	invalidSPIPerSecond = 50          // and this many per second in total
-	invalidSPIMaxTrack  = 4096        // source addresses remembered
+	invalidSPIMaxTrack  = 4096        // SAs remembered
 )
 
 type invalidSPILimiter struct {
@@ -25,7 +26,9 @@ type invalidSPILimiter struct {
 	count  int
 }
 
-func (l *invalidSPILimiter) allow(src net.IP, now time.Time) bool {
+// allow keys on the source address and the initiator SPI: several UEs behind
+// one NAT share the address, and each of them needs its own answer.
+func (l *invalidSPILimiter) allow(src net.IP, spiI uint64, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if now.Sub(l.window) >= time.Second {
@@ -37,13 +40,13 @@ func (l *invalidSPILimiter) allow(src net.IP, now time.Time) bool {
 	if l.last == nil {
 		l.last = make(map[string]time.Time)
 	}
-	key := src.String()
-	if t, ok := l.last[key]; ok && now.Sub(t) < invalidSPIPerSource {
+	key := src.String() + "/" + strconv.FormatUint(spiI, 16)
+	if t, ok := l.last[key]; ok && now.Sub(t) < invalidSPIPerSA {
 		return false
 	}
 	if len(l.last) >= invalidSPIMaxTrack {
 		for k, t := range l.last {
-			if now.Sub(t) >= invalidSPIPerSource {
+			if now.Sub(t) >= invalidSPIPerSA {
 				delete(l.last, k)
 			}
 		}
@@ -66,7 +69,7 @@ func (s *Server) sendInvalidIKESPI(conn *net.UDPConn, remote *net.UDPAddr, hdr *
 	if conn == nil || remote == nil || hdr.Flags&message.ResponseBitCheck != 0 {
 		return
 	}
-	if !s.invalidSPI.allow(remote.IP, time.Now()) {
+	if !s.invalidSPI.allow(remote.IP, hdr.InitiatorSPI, time.Now()) {
 		return
 	}
 	const notifyLen = 8
