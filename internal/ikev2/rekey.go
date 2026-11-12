@@ -188,6 +188,7 @@ func (s *Server) handleCreateChildSA(conn *net.UDPConn, remote *net.UDPAddr, pkt
 	sa := s.lookupSA(hdr.InitiatorSPI)
 	if sa == nil {
 		s.log.Debug("CREATE_CHILD_SA: unknown SPI", "spi_i", hdr.InitiatorSPI, "remote", remote)
+		s.sendInvalidIKESPI(conn, remote, hdr)
 		return
 	}
 

@@ -36,6 +36,9 @@ func (s *Server) handleInformational(conn *net.UDPConn, remote *net.UDPAddr, pkt
 	sa := s.lookupSA(hdr.InitiatorSPI)
 	if sa == nil {
 		s.log.Debug("INFORMATIONAL: unknown SPI", "spi_i", hdr.InitiatorSPI)
+		if isRequest {
+			s.sendInvalidIKESPI(conn, remote, hdr)
+		}
 		return
 	}
 

@@ -93,6 +93,7 @@ func (s *Server) handleIKEAuth(conn *net.UDPConn, remote *net.UDPAddr, pkt []byt
 	sa := s.lookupSA(hdr.InitiatorSPI)
 	if sa == nil {
 		s.log.Warn("IKE_AUTH: unknown SPI", "spi_i", hdr.InitiatorSPI, "remote", remote)
+		s.sendInvalidIKESPI(conn, remote, hdr)
 		return
 	}
 

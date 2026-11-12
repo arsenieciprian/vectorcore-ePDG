@@ -43,6 +43,8 @@ const (
 
 // Server is the IKEv2 responder.
 type Server struct {
+	invalidSPI invalidSPILimiter // rate limit for INVALID_IKE_SPI answers
+
 	cfg     *Config
 	fullCfg *config.Config
 
