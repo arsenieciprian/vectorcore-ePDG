@@ -233,6 +233,12 @@ func (s *Server) handleAuthRound1(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 	// the UE is asking the PGW to preserve its existing PDN connection.
 	if pl.cp != nil && pl.cp.ConfigurationType == message.CFG_REQUEST {
 		for _, attr := range pl.cp.ConfigurationAttribute {
+			switch attr.Type {
+			case cfgPrivatePCSCF4:
+				sa.cpWantsPrivatePCSCF4 = true
+			case cfgPrivatePCSCF6:
+				sa.cpWantsPrivatePCSCF6 = true
+			}
 			if attr.Type == message.INTERNAL_IP4_ADDRESS {
 				sa.cpWantsIP = true
 				if len(attr.Value) == 4 {
@@ -704,6 +710,7 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 			if s.fullCfg != nil {
 				appendDNSFromPCO(cp, pcoData, s.fullCfg.PCO)
 				appendPCSCFFromPCO(cp, pcoData, s.fullCfg.PCO)
+				appendPrivatePCSCF(cp, pcoData, s.fullCfg.PCO, sa.cpWantsPrivatePCSCF4, sa.cpWantsPrivatePCSCF6)
 			}
 		}
 	}
@@ -1187,7 +1194,39 @@ func pemToDER(pemBytes []byte) ([]byte, error) {
 const (
 	internalIP4PCSCF = uint16(20) // P_CSCF_IP4_ADDRESS (RFC 7651 §3)
 	internalIP6PCSCF = uint16(21) // P_CSCF_IP6_ADDRESS (RFC 7651 §3)
+
+	// Private-use attributes (RFC 7296 §3.15.1, 16384-32767) that some handset
+	// IMS stacks request for the P-CSCF instead of, or before, RFC 7651: seen
+	// on a Samsung Galaxy A17 (CFG_REQUEST with 16389 and 16390 and no 20/21),
+	// which then never registers if only attribute 20 comes back. strongSwan
+	// based ePDGs answer them through their attr plugin.
+	cfgPrivatePCSCF4 = uint16(16389)
+	cfgPrivatePCSCF6 = uint16(16390)
 )
+
+// appendPrivatePCSCF repeats the P-CSCF addresses in the private-use
+// attributes, only for the ones the UE asked for in its CFG_REQUEST.
+func appendPrivatePCSCF(cp *message.Configuration, decoded *pco.Decoded, cfg config.PCOConfig, want4, want6 bool) {
+	if decoded == nil {
+		return
+	}
+	if want4 && cfg.RequestPCSCFv4 {
+		for _, ip := range decoded.PCSCFv4 {
+			if ip4 := ip.To4(); ip4 != nil {
+				cp.ConfigurationAttribute.BuildConfigurationAttribute(cfgPrivatePCSCF4, ip4)
+			}
+		}
+	}
+	if want6 && cfg.RequestPCSCFv6 {
+		for _, ip := range decoded.PCSCFv6 {
+			if ip.To4() == nil {
+				if ip16 := ip.To16(); ip16 != nil {
+					cp.ConfigurationAttribute.BuildConfigurationAttribute(cfgPrivatePCSCF6, ip16)
+				}
+			}
+		}
+	}
+}
 
 func appendDNSFromPCO(cp *message.Configuration, decoded *pco.Decoded, cfg config.PCOConfig) {
 	if decoded == nil {

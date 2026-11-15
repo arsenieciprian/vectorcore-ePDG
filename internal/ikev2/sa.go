@@ -66,6 +66,9 @@ type ikeSA struct {
 	eapChallengeMsgID   uint32 // message ID of the round1 IKE_AUTH we responded to
 	eapChallengePayload []byte // cached EAP challenge bytes; retransmit if UE resends round1
 	eapOnly             bool   // UE sent EAP_ONLY_AUTHENTICATION (RFC 5998): no CERT/signature AUTH in round 1
+	// UE asked for the P-CSCF in the private-use CFG attributes 16389/16390.
+	cpWantsPrivatePCSCF4 bool
+	cpWantsPrivatePCSCF6 bool
 
 	// MOBIKE (RFC 4555) state (under mu).
 	mobikeEnabled bool   // negotiated in IKE_AUTH; permits UPDATE_SA_ADDRESSES handling
