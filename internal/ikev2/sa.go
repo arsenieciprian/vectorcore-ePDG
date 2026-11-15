@@ -65,6 +65,7 @@ type ikeSA struct {
 	msk                 []byte // set on EAP-AKA success
 	eapChallengeMsgID   uint32 // message ID of the round1 IKE_AUTH we responded to
 	eapChallengePayload []byte // cached EAP challenge bytes; retransmit if UE resends round1
+	eapOnly             bool   // UE sent EAP_ONLY_AUTHENTICATION (RFC 5998): no CERT/signature AUTH in round 1
 
 	// MOBIKE (RFC 4555) state (under mu).
 	mobikeEnabled bool   // negotiated in IKE_AUTH; permits UPDATE_SA_ADDRESSES handling
@@ -79,7 +80,7 @@ type ikeSA struct {
 	rrMsgID     uint32
 	rrPacket    []byte // encrypted request, resent as-is on retransmission
 	rrTries     int
-	rrMultiAddr bool      // the same request went to more than one address
+	rrMultiAddr bool // the same request went to more than one address
 	rrStarted   time.Time
 
 	// VoLTE→VoWiFi handover (3GPP TS 24.302 §8.2.3).

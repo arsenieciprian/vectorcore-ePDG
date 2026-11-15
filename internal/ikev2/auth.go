@@ -54,6 +54,8 @@ const (
 	// Detected and logged only, to inform whether implementing the full
 	// mechanism is worth the effort for this deployment's UE fleet.
 	notifyIKEv2MultipleBearerPDNConnectivity uint16 = 42011
+	// EAP_ONLY_AUTHENTICATION, RFC 5998 §3 (IANA IKEv2 Notify Message Status Type 16417).
+	notifyEAPOnlyAuthentication uint16 = 16417
 )
 
 // rawPayload implements message.IKEPayload for pre-encoded payload bytes.
@@ -188,6 +190,21 @@ func (s *Server) handleAuthRound1(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 		if n.NotifyMessageType == notifyIKEv2MultipleBearerPDNConnectivity {
 			s.log.Info("IKE_AUTH round1: UE supports IKEv2 multiple bearer PDN connectivity (not implemented by this ePDG)",
 				"imsi", imsi, "remote", remote)
+			break
+		}
+	}
+
+	// RFC 5998: the UE asks to authenticate the ePDG through EAP alone. Every
+	// EAP method this ePDG runs (EAP-AKA, EAP-AKA') is mutually authenticating
+	// and key-generating (RFC 5998 §4), so honour it: the first IKE_AUTH
+	// response then carries no CERT and no signature AUTH, and the ePDG is
+	// authenticated by the MSK-based AUTH after EAP succeeds. TS 24.302
+	// §7.2.2.1 lets the UE ask for this; UEs that trust only their own
+	// operator's CA (or none) need it.
+	for _, n := range pl.notifies {
+		if n.NotifyMessageType == notifyEAPOnlyAuthentication {
+			sa.eapOnly = true
+			s.log.Info("IKE_AUTH round1: UE requested EAP-only authentication (RFC 5998)", "imsi", imsi, "remote", remote)
 			break
 		}
 	}
@@ -712,7 +729,8 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 // Helpers: sending responses
 // ────────────────────────────────────────────────────────────────────────────
 
-// sendEAPResponse sends IDr, [CERT], AUTH, and the given EAP payload.
+// sendEAPResponse sends IDr, [CERT], AUTH, and the given EAP payload (IDr and EAP
+// only when the UE asked for EAP-only authentication, RFC 5998).
 // includeID is true for the first response (round 1); false for subsequent EAP rounds.
 //
 // TS 33.402 §8.2.2 step 6 requires the ePDG to send its identity, a certificate,
@@ -723,7 +741,10 @@ func (s *Server) handleAuthFinal(conn *net.UDPConn, remote *net.UDPAddr, sa *ike
 func (s *Server) sendEAPResponse(conn *net.UDPConn, remote *net.UDPAddr, sa *ikeSA, msgID uint32, eapPayload []byte, includeID bool, natt bool) {
 	var inner message.IKEPayloadContainer
 
-	if includeID {
+	if includeID && sa.eapOnly {
+		// RFC 5998 §3: IDr only; no CERT, no AUTH until EAP has produced the MSK.
+		inner.BuildIdentificationResponder(message.ID_FQDN, []byte(s.epdgIdentity()))
+	} else if includeID {
 		epdgID := s.epdgIdentity()
 		inner.BuildIdentificationResponder(message.ID_FQDN, []byte(epdgID))
 		if len(s.certDER) > 0 {

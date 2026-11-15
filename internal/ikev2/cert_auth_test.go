@@ -10,6 +10,7 @@ import (
 	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"io"
 	"log/slog"
@@ -241,4 +242,82 @@ func generateSelfSignedRSACert(t *testing.T, dnsName string) (certPEM, keyPEM []
 	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	return certPEM, keyPEM
+}
+
+// TestSendEAPResponseEAPOnly: when the UE sent EAP_ONLY_AUTHENTICATION
+// (RFC 5998), the first IKE_AUTH response carries IDr and EAP, but neither
+// CERT nor the signature AUTH, even with a certificate configured.
+func TestSendEAPResponseEAPOnly(t *testing.T) {
+	srv := newTestServerForCert(t)
+	cfg := &config.Config{}
+	cfg.EPDG.Name = repoEPDGName
+	cfg.IKEv2.CertFile = repoCertFile
+	cfg.IKEv2.KeyFile = repoKeyFile
+	if err := srv.SetFullConfig(cfg); err != nil {
+		t.Fatalf("SetFullConfig() error = %v", err)
+	}
+
+	// Loopback UDP pair standing in for the UE.
+	srvConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer srvConn.Close()
+	ueConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ueConn.Close()
+	ueAddr := ueConn.LocalAddr().(*net.UDPAddr)
+
+	key := randomKey(t, encrAesCbc256.KeyLen())
+	integKey := randomKey(t, integSha256_128.KeyLen())
+	saKey := &ikeSAKey{
+		encr: encrAesCbc256, integ: integSha256_128,
+		prf:   prfSha256,
+		SK_er: key, SK_ei: key, SK_ar: integKey, SK_ai: integKey,
+		SK_pr: randomKey(t, 32), SK_pi: randomKey(t, 32),
+	}
+	sa := &ikeSA{
+		saKey:       saKey,
+		initRespRaw: []byte("fake-IKE_SA_INIT-response-bytes"),
+		nonceI:      []byte("fake-nonce-initiator-fake-nonce-initiator"),
+		eapOnly:     true,
+	}
+
+	eapPayload := []byte{1, 1, 0, 4}
+	srv.sendEAPResponse(srvConn, ueAddr, sa, 1, eapPayload, true, false)
+
+	buf := make([]byte, 4096)
+	_ = ueConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := ueConn.Read(buf)
+	if err != nil {
+		t.Fatalf("UE did not receive a response: %v", err)
+	}
+	innerType, plain, err := decryptSK(saKey, buf[:n])
+	if err != nil {
+		t.Fatalf("decryptSK() error = %v", err)
+	}
+	payloads, err := parseAuthPayloads(innerType, plain)
+	if err != nil {
+		t.Fatalf("parseAuthPayloads() error = %v", err)
+	}
+	if payloads.idr == nil {
+		t.Fatal("response missing IDr payload")
+	}
+	if payloads.auth != nil {
+		t.Fatal("EAP-only: response carries an AUTH payload")
+	}
+	if len(payloads.eapRaw) == 0 {
+		t.Fatal("EAP-only: response missing EAP payload")
+	}
+	// No CERT payload anywhere in the chain.
+	for typ, off := uint8(innerType), 0; typ != 0 && off+4 <= len(plain); {
+		if message.IkePayloadType(typ) == message.TypeCERT {
+			t.Fatal("EAP-only: response carries a CERT payload")
+		}
+		next := plain[off]
+		off += int(binary.BigEndian.Uint16(plain[off+2 : off+4]))
+		typ = next
+	}
 }
