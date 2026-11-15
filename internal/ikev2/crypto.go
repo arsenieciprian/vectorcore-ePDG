@@ -34,6 +34,7 @@ import (
 const (
 	prfHmacSha2512      uint16 = 7
 	authHmacSha2512_256 uint16 = 14
+	dhModp1024          uint16 = 2  // IANA Group 2 (1024-bit MODP), RFC 2409 6.2
 	dh256RandomECP      uint16 = 19 // IANA Group 19 (P-256), RFC 5114/5903
 	dh384RandomECP      uint16 = 20 // IANA Group 20 (P-384), RFC 5114/5903
 	encrAESGCM16        uint16 = 20 // ENCR_AES_GCM_16, RFC 5282 (16-octet ICV)
@@ -137,6 +138,24 @@ func (g *ecdhGroup) SharedKey(privAny any, peerPubBytes []byte) ([]byte, error) 
 var ecdh256Group = &ecdhGroup{id: dh256RandomECP, curve: ecdh.P256(), byteLen: 32}
 var ecdh384Group = &ecdhGroup{id: dh384RandomECP, curve: ecdh.P384(), byteLen: 48}
 
+// RFC 2409 Group 2 (1024-bit MODP). Weak by today's standards and only
+// accepted as the last IKE proposal: some handset IMS profiles (seen on a
+// Samsung Galaxy A17 using its built-in profile for an unknown PLMN) offer
+// nothing else in IKE_SA_INIT, AES-CBC-128/HMAC-SHA1/MODP-1024 only.
+var dhGroup2 = &modpGroup{
+	id: dhModp1024,
+	prime: mustParseBig("FFFFFFFFFFFFFFFFC90FDAA22168C234" +
+		"C4C6628B80DC1CD129024E088A67CC74" +
+		"020BBEA63B139B22514A08798E3404DD" +
+		"EF9519B3CD3A431B302B0A6DF25F1437" +
+		"4FE1356D6D51C245E485B576625E7EC6" +
+		"F44C42E9A637ED6B0BFF5CB6F406B7ED" +
+		"EE386BFB5A899FA5AE9F24117C4B1FE6" +
+		"49286651ECE65381FFFFFFFFFFFFFFFF"),
+	generator: big.NewInt(2),
+	byteLen:   128,
+}
+
 // RFC 3526 Group 14 (2048-bit MODP).
 var dhGroup14 = &modpGroup{
 	id: message.DH_2048_BIT_MODP,
@@ -193,6 +212,8 @@ var dhGroup15 = &modpGroup{
 
 func dhGroupByID(id uint16) dhGroup {
 	switch id {
+	case dhModp1024:
+		return dhGroup2
 	case message.DH_2048_BIT_MODP:
 		return dhGroup14
 	case message.DH_3072_BIT_MODP:

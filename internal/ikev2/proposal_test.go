@@ -1,6 +1,7 @@
 package ikev2
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/free5gc/ike/message"
@@ -60,6 +61,7 @@ func TestSelectIKEProposalLegacyUnaffected(t *testing.T) {
 		{"modp14/cbc256/sha256", dhGroup14, encrAesCbc256, integSha256_128, prfSha256},
 		{"modp15/cbc256/sha512", dhGroup15, encrAesCbc256, integSha512_256, prfSha512},
 		{"modp14/cbc128/sha1", dhGroup14, encrAesCbc128, integSha1_96, prfSha1},
+		{"modp2/cbc128/sha1", dhGroup2, encrAesCbc128, integSha1_96, prfSha1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,5 +209,58 @@ func TestSelectESPProposalLegacyUnaffected(t *testing.T) {
 				t.Fatalf("selectESPProposal() = %+v, want encr=%d integ=%d", got, tt.encr.id, tt.integ.id)
 			}
 		})
+	}
+}
+
+// TestDHGroup2 checks the RFC 2409 Group 2 parameters: a 1024-bit safe prime,
+// and a key exchange that agrees on both sides.
+func TestDHGroup2(t *testing.T) {
+	p := dhGroup2.prime
+	if p.BitLen() != 1024 || !p.ProbablyPrime(20) {
+		t.Fatalf("group 2 prime: bitlen=%d prime=%v", p.BitLen(), p.ProbablyPrime(20))
+	}
+	q := new(big.Int).Rsh(p, 1)
+	if !q.ProbablyPrime(20) {
+		t.Fatal("group 2: (p-1)/2 is not prime")
+	}
+	if dhGroupByID(2) != dhGroup2 {
+		t.Fatal("dhGroupByID(2) does not return group 2")
+	}
+	a, err := dhGroup2.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := dhGroup2.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ka, err := dhGroup2.SharedKey(a, dhGroup2.PublicKey(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kb, err := dhGroup2.SharedKey(b, dhGroup2.PublicKey(a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ka) != 128 || string(ka) != string(kb) {
+		t.Fatalf("group 2 shared keys differ or wrong length (%d)", len(ka))
+	}
+	if len(dhGroup2.PublicKey(a)) != 128 {
+		t.Fatal("group 2 public key is not 128 bytes")
+	}
+}
+
+// TestModp2NotPreferred: a UE offering both MODP-2048 and MODP-1024 in the
+// same proposal must get MODP-2048.
+func TestModp2NotPreferred(t *testing.T) {
+	sa := buildIKEOffer(dhGroup14, encrAesCbc128, integSha1_96, prfSha1)
+	sa.Proposals[0].DiffieHellmanGroup = append(sa.Proposals[0].DiffieHellmanGroup,
+		buildIKEOffer(dhGroup2, encrAesCbc128, integSha1_96, prfSha1).Proposals[0].DiffieHellmanGroup...)
+	got, _, err := selectIKEProposal(sa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.dh.TransformID() != dhGroup14.TransformID() {
+		t.Fatalf("picked DH %d, want 14", got.dh.TransformID())
 	}
 }
