@@ -102,8 +102,23 @@ func (s *Server) handleIKEAuth(conn *net.UDPConn, remote *net.UDPAddr, pkt []byt
 	sa.mu.Lock()
 	defer sa.mu.Unlock()
 
+	// RFC 7296 §2.1: a retransmitted request (same message ID as the last
+	// IKE_AUTH we answered) gets the cached response again, in any SA state.
+	// The request is decrypted first so that only a genuine retransmission
+	// from the UE (valid ICV) triggers the resend.
+	if sa.authRespRaw != nil && hdr.MessageID == sa.authRespMsgID {
+		if _, _, err := decryptSK(sa.saKey, pkt); err != nil {
+			s.log.Warn("IKE_AUTH: retransmission with bad integrity, dropped", "err", err, "remote", remote)
+			return
+		}
+		s.log.Info("IKE_AUTH: retransmission, resending cached response",
+			"imsi", sa.imsi, "msg_id", hdr.MessageID, "state", sa.state, "remote", remote)
+		s.send(conn, remote, sa.authRespRaw, natt)
+		return
+	}
+
 	if sa.state != ikeStateAuth {
-		s.log.Warn("IKE_AUTH: SA not in auth state", "state", sa.state, "remote", remote)
+		s.log.Warn("IKE_AUTH: SA not in auth state", "state", sa.state, "msg_id", hdr.MessageID, "remote", remote)
 		return
 	}
 	sa.remoteAddr = remote
@@ -831,6 +846,11 @@ func (s *Server) sendEncryptedRaw(conn *net.UDPConn, remote *net.UDPAddr, sa *ik
 		return fmt.Errorf("encrypt: %w", err)
 	}
 
+	if exchType == message.IKE_AUTH {
+		// Kept for retransmitted requests (see handleIKEAuth); callers hold sa.mu.
+		sa.authRespMsgID = msgID
+		sa.authRespRaw = out
+	}
 	s.send(conn, remote, out, natt)
 	return nil
 }

@@ -66,6 +66,15 @@ type ikeSA struct {
 	eapChallengeMsgID   uint32 // message ID of the round1 IKE_AUTH we responded to
 	eapChallengePayload []byte // cached EAP challenge bytes; retransmit if UE resends round1
 	eapOnly             bool   // UE sent EAP_ONLY_AUTHENTICATION (RFC 5998): no CERT/signature AUTH in round 1
+
+	// Last IKE_AUTH response sent, exactly as sent (encrypted, without the
+	// non-ESP marker), and its message ID (under mu). RFC 7296 §2.1: a
+	// retransmitted request must get this response again — not be processed
+	// as a new one (an EAP response sent to the AAA twice ends in an EAP
+	// failure) and not be dropped (after the final round the SA has left the
+	// auth state and the UE would retransmit until it gives up).
+	authRespMsgID uint32
+	authRespRaw   []byte
 	// UE asked for the P-CSCF in the private-use CFG attributes 16389/16390.
 	cpWantsPrivatePCSCF4 bool
 	cpWantsPrivatePCSCF6 bool
